@@ -3,9 +3,12 @@ package main
 import (
 	"encoding/hex"
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	flag "github.com/spf13/pflag"
 
@@ -81,16 +84,15 @@ func generateWallet() wallet {
 	return wallet{bech32Addr, pubkey, privkey}
 }
 
-func findMatchingWallets(ch chan wallet, quit chan struct{}, m matcher) {
+func findMatchingWallets(ch chan wallet, quit chan struct{}, m matcher, attempts *uint64) {
 	for {
 		select {
 		case <-quit:
 			return
 		default:
 			w := generateWallet()
+			atomic.AddUint64(attempts, 1)
 			if m.Match(w.Address) {
-				// Do a non-blocking write instead of simple `ch <- w` to prevent
-				// blocking when it's time to quit and ch is full.
 				select {
 				case ch <- w:
 				default:
@@ -100,15 +102,119 @@ func findMatchingWallets(ch chan wallet, quit chan struct{}, m matcher) {
 	}
 }
 
+func (m matcher) calculateExpectedAttempts() float64 {
+	// Base probability space for bech32 characters
+	const addressLength = 38 // Standard cosmos address length after prefix
+	
+	// Start with base probability
+	probability := 1.0
+	
+	// Calculate probability for StartsWith
+	if len(m.StartsWith) > 0 {
+		// Each position has 1/32 chance for exact match
+		probability *= math.Pow(1.0/32.0, float64(len(m.StartsWith)))
+	}
+	
+	// Calculate probability for EndsWith
+	if len(m.EndsWith) > 0 {
+		// Each position has 1/32 chance for exact match
+		probability *= math.Pow(1.0/32.0, float64(len(m.EndsWith)))
+	}
+	
+	// Calculate probability for Contains
+	if len(m.Contains) > 0 {
+		// For contains, we have multiple possible positions
+		// Probability is higher than exact match but still requires all characters
+		containsLen := float64(len(m.Contains))
+		possiblePositions := float64(addressLength - len(m.Contains) + 1)
+		probability *= (possiblePositions * math.Pow(1.0/32.0, containsLen))
+	}
+	
+	// Calculate probability for required letters and digits
+	if m.Letters > 0 {
+		// Probability of getting a letter in one position
+		pLetter := float64(len(bech32letters)) / 32.0
+		probability *= math.Pow(pLetter, float64(m.Letters))
+	}
+	
+	if m.Digits > 0 {
+		// Probability of getting a digit in one position
+		pDigit := float64(len(bech32digits)) / 32.0
+		probability *= math.Pow(pDigit, float64(m.Digits))
+	}
+	
+	// Return expected number of attempts (1/probability)
+	if probability > 0 {
+		return 1.0 / probability
+	}
+	return math.MaxFloat64
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%.1fs", d.Seconds())
+	} else if d < time.Hour {
+		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+	} else {
+		return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+	}
+}
+
+func monitorHashRate(attempts *uint64, quit chan struct{}, expectedAttempts float64) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	
+	var lastCount uint64
+	var lastTime time.Time = time.Now()
+	startTime := time.Now()
+
+	for {
+		select {
+		case <-quit:
+			return
+		case <-ticker.C:
+			currentCount := atomic.LoadUint64(attempts)
+			currentTime := time.Now()
+			
+			hashRate := float64(currentCount-lastCount) / currentTime.Sub(lastTime).Seconds()
+			
+			// Calculate ETA
+			if hashRate > 0 {
+				remainingAttempts := expectedAttempts - float64(currentCount)
+				if remainingAttempts < 0 {
+					remainingAttempts = 0
+				}
+				etaSeconds := remainingAttempts / hashRate
+				eta := formatDuration(time.Duration(etaSeconds) * time.Second)
+				elapsedTime := formatDuration(time.Since(startTime))
+				
+				fmt.Printf("\rHash rate: %.2f h/s | Total hashes: %d | Elapsed: %s | ETA: %s", 
+					hashRate, currentCount, elapsedTime, eta)
+			}
+			
+			lastCount = currentCount
+			lastTime = currentTime
+		}
+	}
+}
+
 func findMatchingWalletConcurrent(m matcher, goroutines int) wallet {
 	ch := make(chan wallet)
 	quit := make(chan struct{})
 	defer close(quit)
 
+	var attempts uint64
+	expectedAttempts := m.calculateExpectedAttempts()
+	
+	// Start the hash rate monitor
+	go monitorHashRate(&attempts, quit, expectedAttempts)
+
 	for i := 0; i < goroutines; i++ {
-		go findMatchingWallets(ch, quit, m)
+		go findMatchingWallets(ch, quit, m, &attempts)
 	}
-	return <-ch
+	result := <-ch
+	fmt.Println() // Print newline after the hash rate output
+	return result
 }
 
 const bech32digits = "023456789"
